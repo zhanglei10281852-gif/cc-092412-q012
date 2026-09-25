@@ -27,6 +27,8 @@ class Settings:
     default_page_size: int
     audit_retention_days: int
     job_lease_seconds: int
+    audit_checkpoint_size: int
+    audit_verify_chunk_size: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -42,6 +44,8 @@ class Settings:
             default_page_size=_positive_integer("TOWNSHIP_DEFAULT_PAGE_SIZE", 20, maximum=100),
             audit_retention_days=_positive_integer("TOWNSHIP_AUDIT_RETENTION_DAYS", 365, maximum=3650),
             job_lease_seconds=_positive_integer("TOWNSHIP_JOB_LEASE_SECONDS", 60, maximum=3600),
+            audit_checkpoint_size=_positive_integer("TOWNSHIP_AUDIT_CHECKPOINT_SIZE", 100, maximum=100_000),
+            audit_verify_chunk_size=_positive_integer("TOWNSHIP_AUDIT_VERIFY_CHUNK_SIZE", 500, maximum=100_000),
         )
 
     def public_view(self) -> dict:
@@ -53,4 +57,6 @@ class Settings:
             "default_page_size": self.default_page_size,
             "audit_retention_days": self.audit_retention_days,
             "job_lease_seconds": self.job_lease_seconds,
+            "audit_checkpoint_size": self.audit_checkpoint_size,
+            "audit_verify_chunk_size": self.audit_verify_chunk_size,
         }

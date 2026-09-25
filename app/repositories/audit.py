@@ -4,6 +4,9 @@ import json
 import sqlite3
 from typing import Any
 
+from app.core.audit_chain import GENESIS_DIGEST, event_digest
+from app.core.errors import ConflictError
+from app.repositories.audit_chain import insert_checkpoint
 from app.repositories.base import rows_dict
 
 
@@ -36,25 +39,83 @@ class AuditRepository:
         metadata: dict | None,
         correlation_id: str | None,
         created_at: str,
+        checkpoint_size: int,
     ) -> int:
-        cursor = self.connection.execute(
-            "INSERT INTO audit_events(actor_user_id,actor_name,action,resource_type,resource_id,outcome,"
-            "before_json,after_json,metadata_json,correlation_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                actor_user_id,
-                actor_name,
-                action,
-                resource_type,
-                str(resource_id) if resource_id is not None else None,
-                outcome,
-                json.dumps(redact(before), ensure_ascii=False, sort_keys=True) if before is not None else None,
-                json.dumps(redact(after), ensure_ascii=False, sort_keys=True) if after is not None else None,
-                json.dumps(redact(metadata or {}), ensure_ascii=False, sort_keys=True),
-                correlation_id,
-                created_at,
-            ),
-        )
-        return int(cursor.lastrowid)
+        before_json = json.dumps(redact(before), ensure_ascii=False, sort_keys=True) if before is not None else None
+        after_json = json.dumps(redact(after), ensure_ascii=False, sort_keys=True) if after is not None else None
+        metadata_json = json.dumps(redact(metadata or {}), ensure_ascii=False, sort_keys=True)
+        resource_id_text = str(resource_id) if resource_id is not None else None
+
+        def write() -> int:
+            state = self.connection.execute("SELECT last_seq,last_digest FROM audit_chain_state WHERE id=1").fetchone()
+            if state is None:
+                self.connection.execute(
+                    "INSERT INTO audit_chain_state(id,last_seq,last_digest,updated_at) VALUES(1,0,?,?)",
+                    (GENESIS_DIGEST, created_at),
+                )
+                last_seq, last_digest = 0, GENESIS_DIGEST
+            else:
+                last_seq, last_digest = int(state[0]), str(state[1])
+            seq = last_seq + 1
+            event = {
+                "seq": seq,
+                "actor_user_id": actor_user_id,
+                "actor_name": actor_name,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id_text,
+                "outcome": outcome,
+                "before_json": before_json,
+                "after_json": after_json,
+                "metadata_json": metadata_json,
+                "correlation_id": correlation_id,
+                "created_at": created_at,
+                "prev_digest": last_digest,
+            }
+            digest = event_digest(event)
+            cursor = self.connection.execute(
+                "INSERT INTO audit_events(actor_user_id,actor_name,action,resource_type,resource_id,outcome,"
+                "before_json,after_json,metadata_json,correlation_id,created_at,seq,prev_digest,digest) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    actor_user_id,
+                    actor_name,
+                    action,
+                    resource_type,
+                    resource_id_text,
+                    outcome,
+                    before_json,
+                    after_json,
+                    metadata_json,
+                    correlation_id,
+                    created_at,
+                    seq,
+                    last_digest,
+                    digest,
+                ),
+            )
+            updated = self.connection.execute(
+                "UPDATE audit_chain_state SET last_seq=?,last_digest=?,updated_at=? WHERE id=1 AND last_seq=?",
+                (seq, digest, created_at, last_seq),
+            )
+            if updated.rowcount != 1:
+                raise ConflictError("审计链状态发生并发冲突，写入已回滚")
+            if seq % checkpoint_size == 0:
+                insert_checkpoint(self.connection, start_seq=seq - checkpoint_size + 1, end_seq=seq, created_at=created_at)
+            return int(cursor.lastrowid)
+
+        # 并发写入通过 BEGIN IMMEDIATE 串行化，链状态行条件更新保证序号唯一且连续。
+        if self.connection.in_transaction:
+            return write()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            event_id = write()
+        except Exception:
+            self.connection.rollback()
+            raise
+        else:
+            self.connection.commit()
+            return event_id
 
     def list(
         self,

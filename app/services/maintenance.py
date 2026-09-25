@@ -8,6 +8,7 @@ from datetime import timedelta
 
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.config import Settings
+from app.core.errors import ConflictError
 from app.core.security import Principal
 
 
@@ -43,6 +44,9 @@ class MaintenanceService:
         "petition_flow_records",
         "department_memberships",
         "audit_events",
+        "audit_checkpoints",
+        "audit_chain_state",
+        "audit_verification_runs",
         "background_jobs",
     )
 
@@ -75,6 +79,12 @@ class MaintenanceService:
     def prune_audit(self, principal: Principal) -> dict:
         principal.require("jobs.run")
         cutoff = to_storage(self.clock.now() - timedelta(days=self.settings.audit_retention_days))
+        chained = int(self.connection.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE created_at<? AND seq IS NOT NULL",
+            (cutoff,),
+        ).fetchone()[0])
+        if chained:
+            raise ConflictError("审计链已建立，不能删除已锚定的审计事件；请先导出验证材料并归档")
         cursor = self.connection.execute("DELETE FROM audit_events WHERE created_at<?", (cutoff,))
         return {"deleted_events": cursor.rowcount, "cutoff": cutoff}
 

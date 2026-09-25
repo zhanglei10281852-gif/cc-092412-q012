@@ -4,6 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from app.core.clock import Clock, SystemClock, to_storage
+from app.core.config import Settings
 from app.repositories.audit import AuditRepository
 
 
@@ -15,9 +16,10 @@ class AuditContext:
 
 
 class AuditService:
-    def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None) -> None:
+    def __init__(self, connection: sqlite3.Connection, clock: Clock | None = None, checkpoint_size: int | None = None) -> None:
         self.repository = AuditRepository(connection)
         self.clock = clock or SystemClock()
+        self.checkpoint_size = checkpoint_size or Settings.load().audit_checkpoint_size
 
     def record(
         self,
@@ -43,4 +45,5 @@ class AuditService:
             metadata=metadata,
             correlation_id=context.correlation_id,
             created_at=to_storage(self.clock.now()),
+            checkpoint_size=self.checkpoint_size,
         )

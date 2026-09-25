@@ -7,7 +7,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
+from app.core.audit_chain import GENESIS_DIGEST
 from app.core.clock import to_storage, utc_now
+from app.core.config import Settings
+from app.repositories.audit_chain import AuditChainRepository
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "township.db"
 _local = threading.local()
@@ -97,11 +100,50 @@ CREATE TABLE IF NOT EXISTS audit_events (
     after_json TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     correlation_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    seq INTEGER,
+    prev_digest TEXT,
+    digest TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_events(resource_type, resource_id);
+
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    last_seq INTEGER NOT NULL,
+    last_digest TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_seq INTEGER NOT NULL,
+    end_seq INTEGER NOT NULL,
+    event_count INTEGER NOT NULL,
+    root_digest TEXT NOT NULL,
+    prev_checkpoint_digest TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_checkpoints_end ON audit_checkpoints(end_seq);
+
+CREATE TABLE IF NOT EXISTS audit_verification_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed')),
+    start_seq INTEGER NOT NULL,
+    next_seq INTEGER NOT NULL,
+    target_seq INTEGER NOT NULL,
+    target_digest TEXT NOT NULL,
+    checked_count INTEGER NOT NULL DEFAULT 0,
+    chunk_size INTEGER NOT NULL DEFAULT 500,
+    first_failure_json TEXT,
+    error_message TEXT,
+    triggered_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
@@ -281,10 +323,28 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+def _migrate_audit_integrity(connection: sqlite3.Connection, now: str) -> None:
+    """为既有数据库补齐审计链结构；新库由 SCHEMA 直接建全，此处幂等。"""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)")}
+    if "seq" not in columns:
+        connection.execute("ALTER TABLE audit_events ADD COLUMN seq INTEGER")
+    if "prev_digest" not in columns:
+        connection.execute("ALTER TABLE audit_events ADD COLUMN prev_digest TEXT")
+    if "digest" not in columns:
+        connection.execute("ALTER TABLE audit_events ADD COLUMN digest TEXT")
+    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_seq ON audit_events(seq)")
+    connection.execute(
+        "INSERT OR IGNORE INTO audit_chain_state(id,last_seq,last_digest,updated_at) VALUES(1,0,?,?)",
+        (GENESIS_DIGEST, now),
+    )
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
+    settings = Settings.load()
     with transaction(immediate=True) as connection:
         connection.executescript(SCHEMA)
+        _migrate_audit_integrity(connection, now)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
                 "INSERT OR IGNORE INTO permissions(code,name,resource,action) VALUES(?,?,?,?)",
@@ -307,6 +367,8 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
         )
+        # 历史存量审计事件在启动时自动锚定入链，从明确起点建立首个检查点。
+        AuditChainRepository(connection).anchor_legacy_events(checkpoint_size=settings.audit_checkpoint_size, now=now)
 
 
 def migrate_db() -> None:
