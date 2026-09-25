@@ -9,6 +9,8 @@ from datetime import timedelta
 from app.core.clock import Clock, SystemClock, to_storage
 from app.core.config import Settings
 from app.core.security import Principal
+from app.repositories.audit import AuditRepository
+from app.services.audit import AuditService
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,10 @@ class MaintenanceService:
         "petition_flow_records",
         "department_memberships",
         "audit_events",
+        "audit_chain_state",
+        "audit_checkpoints",
+        "audit_chain_truncations",
+        "audit_verify_state",
         "background_jobs",
     )
 
@@ -75,8 +81,29 @@ class MaintenanceService:
     def prune_audit(self, principal: Principal) -> dict:
         principal.require("jobs.run")
         cutoff = to_storage(self.clock.now() - timedelta(days=self.settings.audit_retention_days))
-        cursor = self.connection.execute("DELETE FROM audit_events WHERE created_at<?", (cutoff,))
-        return {"deleted_events": cursor.rowcount, "cutoff": cutoff}
+        # 先确保链已封存，再只清理被检查点覆盖的区段，并留下截断锚点供后续校验衔接
+        AuditService(self.connection, self.clock).initialize_chain()
+        repository = AuditRepository(self.connection)
+        last_checkpoint = repository.last_checkpoint()
+        if last_checkpoint is None:
+            return {"deleted_events": 0, "cutoff": cutoff, "note": "尚无检查点覆盖，保留全部审计事件"}
+        row = self.connection.execute(
+            "SELECT MAX(seq) FROM audit_events WHERE created_at<? AND seq<=?",
+            (cutoff, last_checkpoint["seq_end"]),
+        ).fetchone()
+        seq_through = row[0]
+        existing = repository.latest_truncation()
+        if seq_through is None or (existing is not None and seq_through <= existing["seq_through"]):
+            return {"deleted_events": 0, "cutoff": cutoff}
+        head_digest = self.connection.execute("SELECT digest FROM audit_events WHERE seq=?", (seq_through,)).fetchone()[0]
+        cursor = self.connection.execute("DELETE FROM audit_events WHERE seq<=?", (seq_through,))
+        repository.insert_truncation(
+            seq_through=seq_through,
+            head_digest=head_digest,
+            deleted_count=cursor.rowcount,
+            created_at=to_storage(self.clock.now()),
+        )
+        return {"deleted_events": cursor.rowcount, "cutoff": cutoff, "seq_through": seq_through, "head_digest": head_digest}
 
     def database_diagnostics(self, principal: Principal) -> dict:
         principal.require("audit.read")

@@ -97,11 +97,51 @@ CREATE TABLE IF NOT EXISTS audit_events (
     after_json TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
     correlation_id TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    seq INTEGER,
+    prev_digest TEXT,
+    digest TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_resource ON audit_events(resource_type, resource_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_seq ON audit_events(seq);
+
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_seq INTEGER NOT NULL,
+    head_digest TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq_start INTEGER NOT NULL,
+    seq_end INTEGER NOT NULL UNIQUE,
+    event_count INTEGER NOT NULL,
+    chain_head_digest TEXT NOT NULL,
+    prev_checkpoint_digest TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_chain_truncations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seq_through INTEGER NOT NULL,
+    head_digest TEXT NOT NULL,
+    deleted_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_verify_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_verified_seq INTEGER NOT NULL DEFAULT 0,
+    last_verified_digest TEXT,
+    last_run_at TEXT,
+    last_status TEXT NOT NULL DEFAULT 'never' CHECK (last_status IN ('never','ok','broken')),
+    failure_json TEXT,
+    runs_completed INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS idempotency_records (
     scope TEXT NOT NULL,
@@ -281,9 +321,46 @@ def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
         connection.commit()
 
 
+@contextmanager
+def ensure_transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """确保后续语句处于即时事务中；已处于事务时直接复用外层事务。"""
+    if connection.in_transaction:
+        yield connection
+        return
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield connection
+    except Exception:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+AUDIT_CHAIN_COLUMNS = (
+    ("seq", "ALTER TABLE audit_events ADD COLUMN seq INTEGER"),
+    ("prev_digest", "ALTER TABLE audit_events ADD COLUMN prev_digest TEXT"),
+    ("digest", "ALTER TABLE audit_events ADD COLUMN digest TEXT"),
+)
+
+
+def _migrate_audit_chain(connection: sqlite3.Connection) -> None:
+    """为既有数据库补齐审计链列（新装数据库由 SCHEMA 直接建出）。"""
+    table = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'"
+    ).fetchone()
+    if table is None:
+        return
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(audit_events)").fetchall()}
+    for column, ddl in AUDIT_CHAIN_COLUMNS:
+        if column not in existing:
+            connection.execute(ddl)
+
+
 def init_db() -> None:
     now = to_storage(utc_now())
     with transaction(immediate=True) as connection:
+        _migrate_audit_chain(connection)
         connection.executescript(SCHEMA)
         for code, name, resource, action in PERMISSIONS:
             connection.execute(
